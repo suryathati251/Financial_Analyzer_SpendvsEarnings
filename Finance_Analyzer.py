@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import pdfplumber
 
 st.set_page_config(page_title='Private Finance Statement Analyzer', page_icon='💳', layout='wide')
 
@@ -28,6 +29,8 @@ CATEGORY_RULES = {
 
 ESSENTIAL_CATEGORIES = {'Housing', 'Utilities', 'Groceries', 'Health', 'Insurance', 'Transport'}
 NON_ESSENTIAL_CATEGORIES = {'Dining', 'Shopping', 'Subscriptions', 'Travel', 'Cash'}
+DATE_RE = re.compile(r'(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)')
+AMOUNT_RE = re.compile(r'\(?-?\$?[\d,]+\.\d{2}\)?')
 
 
 def normalize_columns(df):
@@ -46,8 +49,7 @@ def normalize_columns(df):
             rename_map[c] = 'credit'
         elif c in ['type', 'transaction type']:
             rename_map[c] = 'type'
-    df = df.rename(columns=rename_map)
-    return df
+    return df.rename(columns=rename_map)
 
 
 def parse_amount(val):
@@ -60,8 +62,90 @@ def parse_amount(val):
         s = '-' + s[1:-1]
     try:
         return float(s)
-    except:
+    except Exception:
         return np.nan
+
+
+def clean_pdf_amount(raw):
+    if raw is None:
+        return np.nan
+    s = str(raw).strip().replace('$', '').replace(',', '')
+    if not s:
+        return np.nan
+    if s.startswith('(') and s.endswith(')'):
+        s = '-' + s[1:-1]
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def parse_pdf_text_rows(file_obj, source_name):
+    rows = []
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ''
+            for line in text.split('\n'):
+                line = ' '.join(line.split())
+                if len(line) < 8:
+                    continue
+                date_match = DATE_RE.search(line)
+                amounts = AMOUNT_RE.findall(line)
+                if not date_match or not amounts:
+                    continue
+                date_str = date_match.group(1)
+                amount = clean_pdf_amount(amounts[-1])
+                if pd.isna(amount):
+                    continue
+                desc = line.replace(date_str, '', 1)
+                last_amt = amounts[-1]
+                idx = desc.rfind(last_amt)
+                if idx != -1:
+                    desc = desc[:idx]
+                desc = desc.strip(' -|')
+                if len(desc) < 2:
+                    continue
+                rows.append({'date': date_str, 'description': desc, 'amount': amount, 'source_file': source_name})
+    return pd.DataFrame(rows)
+
+
+def parse_pdf_tables(file_obj, source_name):
+    rows = []
+    with pdfplumber.open(file_obj) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables or []:
+                if not table or len(table) < 2:
+                    continue
+                headers = [str(h).strip().lower() if h else '' for h in table[0]]
+                for r in table[1:]:
+                    vals = [str(v).strip() if v is not None else '' for v in r]
+                    record = dict(zip(headers, vals))
+                    rows.append(record)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df['source_file'] = source_name
+    return df
+
+
+def extract_pdf_statement(file_obj, source_name):
+    file_bytes = file_obj.read()
+    table_df = parse_pdf_tables(io.BytesIO(file_bytes), source_name)
+    text_df = parse_pdf_text_rows(io.BytesIO(file_bytes), source_name)
+
+    candidates = []
+    if not table_df.empty:
+        candidates.append(table_df)
+    if not text_df.empty:
+        candidates.append(text_df)
+    if not candidates:
+        raise ValueError('Could not extract transactions from PDF. Try a digital statement PDF with selectable text, or upload CSV/Excel export.')
+
+    best = max(candidates, key=lambda x: len(x))
+    return best
 
 
 def standardize_transactions(df, source_name='uploaded'):
@@ -99,10 +183,7 @@ def analyze(df):
     df['category'] = [categorize(d, a) for d, a in zip(df['description'], df['net_amount'])]
     df['income'] = np.where(df['net_amount'] > 0, df['net_amount'], 0.0)
     df['expense'] = np.where(df['net_amount'] < 0, -df['net_amount'], 0.0)
-    monthly = df.groupby('month', as_index=False).agg(
-        income=('income', 'sum'),
-        expenses=('expense', 'sum')
-    )
+    monthly = df.groupby('month', as_index=False).agg(income=('income', 'sum'), expenses=('expense', 'sum'))
     monthly['net_savings'] = monthly['income'] - monthly['expenses']
     monthly['savings_rate_pct'] = np.where(monthly['income'] > 0, (monthly['net_savings'] / monthly['income']) * 100, 0)
     cat_month = df[df['expense'] > 0].groupby(['month', 'category'], as_index=False)['expense'].sum()
@@ -116,32 +197,24 @@ def savings_suggestions(monthly, cat_total):
     avg_income = float(monthly['income'].mean()) if not monthly.empty else 0.0
     avg_exp = float(monthly['expenses'].mean()) if not monthly.empty else 0.0
     avg_save_rate = float(monthly['savings_rate_pct'].mean()) if not monthly.empty else 0.0
-
     if avg_income > 0 and avg_save_rate < 20:
         needed = max(0, 0.2 * avg_income - (avg_income - avg_exp))
         tips.append(f'Your average savings rate is {avg_save_rate:.1f}%. To reach a 20% savings rate, target about ${needed:,.0f} in extra monthly savings.')
-
     for _, row in cat_total.head(5).iterrows():
         cat = row['category']
         amt = float(row['expense'])
         pct = (amt / total_exp * 100) if total_exp else 0
         if cat in NON_ESSENTIAL_CATEGORIES and pct >= 8:
-            cut_10 = amt * 0.10
-            cut_20 = amt * 0.20
-            tips.append(f'{cat} is a high discretionary category at ${amt:,.0f} total ({pct:.1f}% of expenses). Cutting 10% could save about ${cut_10:,.0f}; cutting 20% could save about ${cut_20:,.0f}.')
+            tips.append(f'{cat} is a high discretionary category at ${amt:,.0f} total ({pct:.1f}% of expenses). Cutting 10% could save about ${amt*0.10:,.0f}; cutting 20% could save about ${amt*0.20:,.0f}.')
         elif cat in ESSENTIAL_CATEGORIES and pct >= 20:
             tips.append(f'{cat} is one of your biggest essential categories at ${amt:,.0f} total ({pct:.1f}% of expenses). Review for optimization opportunities such as plan changes, rate shopping, or bill negotiation.')
-
     subs = cat_total[cat_total['category'] == 'Subscriptions']
     if not subs.empty and float(subs['expense'].iloc[0]) > 50:
         tips.append('Subscriptions appear meaningful. Review duplicate streaming, software, and membership charges for cancellations or downgrades.')
-
     dining = cat_total[cat_total['category'] == 'Dining']
     groceries = cat_total[cat_total['category'] == 'Groceries']
-    if not dining.empty and not groceries.empty:
-        if float(dining['expense'].iloc[0]) > 0.6 * float(groceries['expense'].iloc[0]):
-            tips.append('Dining spend is high relative to groceries. Shifting a few meals per week from takeout/restaurants to groceries may materially improve monthly savings.')
-
+    if not dining.empty and not groceries.empty and float(dining['expense'].iloc[0]) > 0.6 * float(groceries['expense'].iloc[0]):
+        tips.append('Dining spend is high relative to groceries. Shifting a few meals per week from takeout/restaurants to groceries may materially improve monthly savings.')
     if not tips:
         tips.append('Your spending appears fairly balanced. Focus on consistent saving automation and reviewing the top 2 expense categories for incremental improvements.')
     return tips
@@ -156,37 +229,34 @@ def export_summary(monthly, cat_total):
 
 
 st.title('💳 Private Finance Statement Analyzer')
-st.caption('Upload bank, savings, and credit card statements to analyze income, spending, categories, and savings opportunities — processed in memory only.')
+st.caption('Upload bank, savings, credit card, or PDF statements to analyze income, spending, categories, and savings opportunities — processed in memory only.')
 
 with st.sidebar:
     st.header('Privacy first')
     st.success('Files are processed only during your session and are not intentionally saved by the app.')
-    st.write('Recommended file types: CSV or Excel exports from your bank or card provider.')
-    st.write('Expected columns: Date, Description, and either Amount or Debit/Credit.')
+    st.write('Supported file types: CSV, Excel, and text-based PDF statements.')
+    st.write('Best results: digital bank PDFs with selectable text, or bank CSV/Excel exports.')
+    st.write('Expected table fields: Date, Description, and either Amount or Debit/Credit.')
 
-files = st.file_uploader('Upload one or more statements', type=['csv', 'xlsx', 'xls'], accept_multiple_files=True)
+files = st.file_uploader('Upload one or more statements', type=['csv', 'xlsx', 'xls', 'pdf'], accept_multiple_files=True)
 
 if not files:
-    st.info('Upload statements to begin. Example sources: checking, savings, and credit card exports.')
-    st.markdown('''
-### What this app does
-- Combines multiple statement files
-- Calculates monthly income, expenses, and net savings
-- Categorizes spending automatically
-- Highlights top spending areas
-- Suggests where you may be able to cut back
-- Avoids persistent file storage in app logic
-''')
+    st.info('Upload statements to begin. Sources can include checking, savings, credit card, and PDF statement exports.')
     st.stop()
 
 all_frames = []
 errors = []
 for f in files:
     try:
-        if f.name.lower().endswith('.csv'):
+        name = f.name.lower()
+        if name.endswith('.csv'):
             raw = pd.read_csv(f)
-        else:
+        elif name.endswith('.xlsx') or name.endswith('.xls'):
             raw = pd.read_excel(f)
+        elif name.endswith('.pdf'):
+            raw = extract_pdf_statement(f, f.name)
+        else:
+            raise ValueError('Unsupported file type.')
         all_frames.append(standardize_transactions(raw, f.name))
     except Exception as e:
         errors.append(f'{f.name}: {e}')
@@ -200,7 +270,6 @@ if not all_frames:
 
 transactions = pd.concat(all_frames, ignore_index=True).drop_duplicates()
 transactions, monthly, cat_month, cat_total = analyze(transactions)
-
 suggestions = savings_suggestions(monthly, cat_total)
 
 col1, col2, col3, col4 = st.columns(4)
@@ -247,9 +316,8 @@ st.download_button('Download summary workbook', data=excel_bytes, file_name='fin
 
 st.markdown('---')
 st.markdown('''
-### Hosting notes
-- Safe for GitHub and Streamlit deployment.
-- The app code does not write uploaded files to disk.
-- Uploaded files are processed in memory for analysis during the active session.
-- Do not add custom logging that captures uploaded statement contents.
+### PDF support notes
+- Works best with digital PDFs that contain selectable text.
+- Scanned-image PDFs may need OCR before accurate extraction.
+- Different banks format PDF statements differently, so some files may need a bank-specific parser in a future version.
 ''')
