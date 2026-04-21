@@ -403,3 +403,4 @@ fig.update_layout(barmode='group', height=420)
 st.plotly_chart(fig, use_container_width=True)
 st.dataframe(df.head(50), use_container_width=True)
 st.download_button('Download workbook', to_excel(monthly, cat, df), 'finance_analysis.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
