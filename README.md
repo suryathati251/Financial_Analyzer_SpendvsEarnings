@@ -1,18 +1,25 @@
-# Private Finance Statement Analyzer
+# Finance Statement Analyzer
 
-A privacy-first Streamlit app that lets users upload checking, savings, and credit card statements and view:
-- Monthly income and expenses
-- Expense categories
-- Net savings and savings rate
-- Suggestions on where to reduce spending
+A Streamlit app for analyzing bank, savings, and credit card statements from CSV, Excel, and PDF files.
 
-## Privacy model
-- Uploaded files are processed in memory during the active session.
-- The app does not intentionally save uploaded statement files.
-- Do not add logging of uploaded file contents.
+## Features
+- Upload multiple statement files at once
+- Supports CSV, XLSX, XLS, and PDF
+- Custom PDF parsing logic for Chase-style and Citi-style statements
+- Monthly income, expenses, and net savings summary
+- Automatic category tagging
+- Spending charts and category breakdowns
+- Savings suggestions based on discretionary spending patterns
+- Downloadable Excel workbook of results
 
-## Expected input
-Upload CSV or Excel files with columns such as:
+## Privacy
+- The app processes uploaded files during the session.
+- The app is written to avoid intentionally saving uploaded source files.
+- Avoid adding custom logs or third-party analytics that may capture sensitive financial data.
+
+## Supported inputs
+### Tabular files
+Use files with columns like:
 - Date
 - Description
 - Amount
@@ -23,19 +30,28 @@ Or:
 - Debit
 - Credit
 
-## Run locally
+### PDF files
+- Best for digital PDFs with selectable text
+- Includes custom parsing logic for Chase and Citi layouts
+- Some issuers and scanned PDFs may still need parser tuning or OCR
+
+## Local setup
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Community Cloud
-1. Push this folder to a GitHub repository.
-2. Go to https://streamlit.io/cloud
-3. Create a new app.
-4. Select your GitHub repo.
-5. Set the main file path to `app.py`.
-6. Deploy.
+## Deploy on Streamlit Community Cloud
+1. Create a GitHub repository.
+2. Upload `app.py`, `requirements.txt`, `README.md`, and `.gitignore`.
+3. Go to https://streamlit.io/cloud
+4. Create a new app.
+5. Select your GitHub repository and branch.
+6. Set the main file path to `app.py`.
+7. Deploy.
 
-## Important note
-This app is designed to avoid persistent storage of uploaded files in app logic, but you should still review Streamlit hosting behavior and avoid adding analytics or logs that could capture sensitive data.
+## Recommended next improvements
+- Add bank-specific templates for more issuers
+- Add OCR support for scanned PDFs
+- Add a parser review screen so users can approve extracted transactions before analysis
+- Add recurring subscription detection and budgeting features
