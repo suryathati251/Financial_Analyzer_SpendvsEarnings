@@ -12,13 +12,13 @@ st.set_page_config(page_title='Finance Statement Analyzer', page_icon='💼', la
 CATEGORY_RULES = {
     'Income': [r'payroll', r'direct deposit', r'payment from', r'zelle payment from', r'interest', r'dividend', r'refund', r'credit'],
     'Housing': [r'rent', r'mortgage', r'hoa', r'clickpay', r'firstservice'],
-    'Utilities': [r'utility', r'firstenergy', r'public services electric', r'pse&g', r'att bill payment', r'cricket wireless', r'phone', r'internet'],
-    'Groceries': [r'costco', r'stop shop', r'shoprite', r'trader joe', r'patel brothers', r'acme', r'whole foods', r'wegmans', r'apna bazar', r'walmart'],
+    'Utilities': [r'utility', r'firstenergy', r'public services electric', r'pse&g', r'att bill payment', r'cricket wireless', r'phone', r'internet', r'ezpass'],
+    'Groceries': [r'costco', r'stop shop', r'shoprite', r'trader joe', r'patel brothers', r'acme', r'whole foods', r'wegmans', r'apna bazar'],
     'Dining': [r'restaurant', r'dhaba', r'panera', r'starbucks', r'bagel', r'wonder', r'burger', r'taco', r'pizza', r'paris baguette', r'sushi'],
-    'Transport': [r'ezpass', r'gas', r'quick chek', r'wawa', r'bp', r'exxon', r'uber', r'lyft', r'parking', r'tesla supercharger', r'crown car wash'],
-    'Shopping': [r'amazon', r'target', r'macys', r'lacoste', r'costco.com', r'temu', r'underarmour', r'apple\.combill', r'home depot'],
+    'Transport': [r'gas', r'quick chek', r'wawa', r'bp', r'exxon', r'uber', r'lyft', r'parking', r'tesla supercharger', r'crown car wash', r'nj ezpass'],
+    'Shopping': [r'amazon', r'target', r'macys', r'lacoste', r'costco.com', r'temu', r'underarmour', r'apple\.combill', r'home depot', r'great clips'],
     'Health': [r'walgreens', r'pharmacy', r'orthopaedic', r'peds', r'diagnostics', r'optical', r'eyecare', r'ouraring'],
-    'Insurance': [r'geico', r'insurance'],
+    'Insurance': [r'geico', r'insurance', r'firstservice'],
     'Subscriptions': [r'patreon', r'uber one', r'youtube', r'disney plus', r'hp instant ink', r'linkedin', r'tesla subscription', r'apple\.combill'],
     'Travel': [r'airbnb', r'united', r'american air', r'alaska air', r'chase travel', r'cruise', r'dcl', r'frontier'],
     'Transfers': [r'payment thank you', r'online payment', r'payment to chase card', r'online realtime transfer', r'online transfer to sav', r'zelle payment to', r'robinhood debits', r'transfer to bofa'],
@@ -26,9 +26,6 @@ CATEGORY_RULES = {
     'Education': [r'outschool', r'quizlet', r'board of educa', r'taekwondo', r'swim school'],
     'Entertainment': [r'sixflags', r'amc', r'urban air'],
 }
-
-MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
-
 
 def parse_amount(v):
     s = str(v).strip().replace('$', '').replace(',', '')
@@ -39,10 +36,8 @@ def parse_amount(v):
     except Exception:
         return np.nan
 
-
 def compact(s):
     return ' '.join(str(s).split())
-
 
 def classify_category(desc, amount):
     text = str(desc).lower()
@@ -51,14 +46,12 @@ def classify_category(desc, amount):
             return cat
     return 'Income' if amount > 0 else 'Other'
 
-
 def read_pdf_pages(file_bytes):
     pages = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for p in pdf.pages:
             pages.append(p.extract_text(x_tolerance=1, y_tolerance=1) or '')
     return pages
-
 
 def detect_layout(text, filename):
     t = (text + ' ' + filename).lower()
@@ -78,7 +71,6 @@ def detect_layout(text, filename):
         return 'generic_bank'
     return 'generic_bank'
 
-
 def finalize_df(rows, source_name):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -88,19 +80,26 @@ def finalize_df(rows, source_name):
     df['source_file'] = source_name
     return df[['date', 'description', 'net_amount', 'source_file', 'statement_category']]
 
-
 def extract_chase_annual(file_bytes, source_name):
     txt = '\n'.join(read_pdf_pages(file_bytes))
     rows = []
-    for m in re.finditer(r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})(?=\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}|\s*$)', txt, flags=re.S):
-        d, desc, amt = m.groups()
-        a = parse_amount(amt)
-        net = -abs(a) if a > 0 else abs(a)
-        rows.append({'date': d, 'description': compact(desc), 'net_amount': net, 'statement_category': None})
+    patterns = [
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})(?=\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}|\s*$)',
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})'
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, txt, flags=re.S):
+            d, desc, amt = m.groups()
+            a = parse_amount(amt)
+            if np.isnan(a):
+                continue
+            net = -abs(a) if a > 0 else abs(a)
+            rows.append({'date': d, 'description': compact(desc), 'net_amount': net, 'statement_category': None})
+        if rows:
+            break
     if not rows:
         raise ValueError('No Chase annual transactions extracted.')
     return finalize_df(rows, source_name)
-
 
 def extract_citi_annual(file_bytes, source_name):
     txt = '\n'.join(read_pdf_pages(file_bytes))
@@ -108,15 +107,17 @@ def extract_citi_annual(file_bytes, source_name):
     for m in re.finditer(r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})(?=\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}|\s*$)', txt, flags=re.S):
         d, desc, amt = m.groups()
         a = parse_amount(amt)
+        if np.isnan(a):
+            continue
         net = -abs(a) if a > 0 else abs(a)
         rows.append({'date': d, 'description': compact(desc), 'net_amount': net, 'statement_category': None})
     if not rows:
         raise ValueError('No Citi annual transactions extracted.')
     return finalize_df(rows, source_name)
 
-
 def extract_chase_credit_monthly(file_bytes, source_name):
     rows, section = [], None
+    date_re = re.compile(r'^(?:\d{4}\s+)?(\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})$')
     for text in read_pdf_pages(file_bytes):
         for raw in text.split('\n'):
             line = compact(raw)
@@ -133,11 +134,13 @@ def extract_chase_credit_monthly(file_bytes, source_name):
                 continue
             if any(skip in line for skip in ['ACCOUNT ACTIVITY', 'Date of Transaction Merchant Name or Transaction Description Amount', 'TOTAL FEES FOR THIS PERIOD', '2026 Totals', 'Year-to-Date', 'INTEREST CHARGES', 'Order Number', 'REWARDS', 'RETURNS AND OTHER CREDITS', 'PURCHASES AND REDEMPTIONS']):
                 continue
-            m = re.match(r'^(\d{4})\s+(.+?)\s+(-?[\d,]+\.\d{2})$', line)
+            m = date_re.match(line)
             if not m:
                 continue
             date4, desc, amt = m.groups()
             a = parse_amount(amt)
+            if np.isnan(a):
+                continue
             year = 2025 if date4.startswith('12') else 2026
             date_txt = f"{date4[:2]}/{date4[2:]}/{year}"
             net = a
@@ -149,7 +152,6 @@ def extract_chase_credit_monthly(file_bytes, source_name):
     if not rows:
         raise ValueError('No Chase monthly credit transactions extracted.')
     return finalize_df(rows, source_name)
-
 
 def extract_chase_checking(file_bytes, source_name):
     rows = []
@@ -164,13 +166,15 @@ def extract_chase_checking(file_bytes, source_name):
             if not m:
                 continue
             date4, desc, amt, bal = m.groups()
+            a = parse_amount(amt)
+            if np.isnan(a):
+                continue
             year = 2025 if date4.startswith('12') else 2026
             date_txt = f"{date4[:2]}/{date4[2:]}/{year}"
-            rows.append({'date': date_txt, 'description': compact(desc), 'net_amount': parse_amount(amt), 'statement_category': None})
+            rows.append({'date': date_txt, 'description': compact(desc), 'net_amount': a, 'statement_category': None})
     if not rows:
         raise ValueError('No Chase checking transactions extracted.')
     return finalize_df(rows, source_name)
-
 
 def extract_citi_monthly(file_bytes, source_name):
     rows = []
@@ -183,13 +187,15 @@ def extract_citi_monthly(file_bytes, source_name):
             if not m:
                 continue
             sale, post, desc, amt = m.groups()
+            a = parse_amount(amt)
+            if np.isnan(a):
+                continue
             year = 2025 if sale.startswith('12') else 2026
             date_txt = f"{sale[:2]}/{sale[2:]}/{year}"
-            rows.append({'date': date_txt, 'description': compact(desc), 'net_amount': parse_amount(amt), 'statement_category': None})
+            rows.append({'date': date_txt, 'description': compact(desc), 'net_amount': a, 'statement_category': None})
     if not rows:
         raise ValueError('No Citi monthly transactions extracted.')
     return finalize_df(rows, source_name)
-
 
 def extract_amex_monthly(file_bytes, source_name):
     rows, mode = [], None
@@ -208,6 +214,9 @@ def extract_amex_monthly(file_bytes, source_name):
             if not m:
                 continue
             date_raw, desc, amt = m.groups()
+            a = parse_amount(amt)
+            if np.isnan(a):
+                continue
             if len(date_raw) == 8:
                 mm, dd, yyyy = date_raw[:2], date_raw[2:4], date_raw[4:]
                 date_txt = f'{mm}/{dd}/{yyyy}'
@@ -215,7 +224,6 @@ def extract_amex_monthly(file_bytes, source_name):
                 mm, dd = date_raw[:2], date_raw[2:4]
                 year = 2026 if mm in ['01', '02', '03', '04'] else 2025
                 date_txt = f'{mm}/{dd}/{year}'
-            a = parse_amount(amt)
             net = a
             if mode == 'charge':
                 net = -abs(a)
@@ -226,7 +234,6 @@ def extract_amex_monthly(file_bytes, source_name):
         raise ValueError('No Amex monthly transactions extracted.')
     return finalize_df(rows, source_name)
 
-
 def extract_generic_bank(file_bytes, source_name):
     rows = []
     for text in read_pdf_pages(file_bytes):
@@ -235,11 +242,12 @@ def extract_generic_bank(file_bytes, source_name):
             m = re.search(r'(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(-?[\d,]+\.\d{2})(?:\s+(-?[\d,]+\.\d{2}))?$', line)
             if m:
                 date_txt, desc, amt, _ = m.groups()
-                rows.append({'date': date_txt, 'description': desc, 'net_amount': parse_amount(amt), 'statement_category': None})
+                a = parse_amount(amt)
+                if not np.isnan(a):
+                    rows.append({'date': date_txt, 'description': desc, 'net_amount': a, 'statement_category': None})
     if not rows:
         raise ValueError('No generic PDF transactions extracted.')
     return finalize_df(rows, source_name)
-
 
 def parse_pdf_statement(uploaded_file):
     file_bytes = uploaded_file.read()
@@ -260,7 +268,6 @@ def parse_pdf_statement(uploaded_file):
         return extract_amex_monthly(file_bytes, uploaded_file.name)
     return extract_generic_bank(file_bytes, uploaded_file.name)
 
-
 def build_dataset(files):
     frames, errors = [], []
     for f in files:
@@ -280,16 +287,18 @@ def build_dataset(files):
         return pd.DataFrame(), errors
     return pd.concat(frames, ignore_index=True), errors
 
-
 def normalize_categories(df):
     df = df.copy()
     mapping = {
-        'BILLSANDUTILITIES':'Utilities','FOODANDDRINK':'Dining','GAS':'Transport','GROCERIES':'Groceries','HEALTHANDWELLNESS':'Health','SHOPPING':'Shopping','TRAVEL':'Travel','ENTERTAINMENT':'Entertainment','EDUCATION':'Education','FEESANDADJUSTMENTS':'Fees','AUTOMOTIVE':'Transport','HOME':'Housing','PERSONAL':'Other','PROFESSIONALSERVICES':'Other','GIFTSANDDONATIONS':'Other',
-        'Merchandise':'Shopping','Restaurants':'Dining','Services':'Other','Vehicle Services':'Transport','Organizations':'Education','Entertainment':'Entertainment'
+        'BILLSANDUTILITIES': 'Utilities', 'FOODANDDRINK': 'Dining', 'GAS': 'Transport', 'GROCERIES': 'Groceries',
+        'HEALTHANDWELLNESS': 'Health', 'SHOPPING': 'Shopping', 'TRAVEL': 'Travel', 'ENTERTAINMENT': 'Entertainment',
+        'EDUCATION': 'Education', 'FEESANDADJUSTMENTS': 'Fees', 'AUTOMOTIVE': 'Transport', 'HOME': 'Housing',
+        'PERSONAL': 'Other', 'PROFESSIONALSERVICES': 'Other', 'GIFTSANDDONATIONS': 'Other',
+        'Merchandise': 'Shopping', 'Restaurants': 'Dining', 'Services': 'Other',
+        'Vehicle Services': 'Transport', 'Organizations': 'Education'
     }
     df['category'] = [mapping.get(sc, classify_category(d, a)) for sc, d, a in zip(df.get('statement_category', [None]*len(df)), df['description'], df['net_amount'])]
     return df
-
 
 def analyze(df):
     df = normalize_categories(df)
@@ -302,7 +311,6 @@ def analyze(df):
     cat = df[df['expense'] > 0].groupby('category', as_index=False)['expense'].sum().sort_values('expense', ascending=False)
     return df.sort_values('date'), monthly.sort_values('month'), cat
 
-
 def to_excel(monthly, cat, txns):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
@@ -313,7 +321,7 @@ def to_excel(monthly, cat, txns):
 
 st.title('💼 Finance Statement Analyzer')
 st.write('Upload bank and credit card statements to see monthly earnings, expenses, and categories. Files are processed in-memory during the session.')
-files = st.file_uploader('Upload statements', type=['pdf','csv','xlsx','xls'], accept_multiple_files=True)
+files = st.file_uploader('Upload statements', type=['pdf', 'csv', 'xlsx', 'xls'], accept_multiple_files=True)
 if not files:
     st.info('Upload your statements to analyze earnings and expenses.')
     st.stop()
@@ -355,7 +363,7 @@ st.subheader('Transactions')
 show = df.copy()
 show['date'] = show['date'].dt.strftime('%Y-%m-%d')
 show['net_amount'] = show['net_amount'].round(2)
-st.dataframe(show[['date','description','statement_category','category','net_amount','source_file']], use_container_width=True, hide_index=True, height=420)
+st.dataframe(show[['date', 'description', 'statement_category', 'category', 'net_amount', 'source_file']], use_container_width=True, hide_index=True, height=420)
 
 st.download_button('Download workbook', to_excel(monthly, cat, show), 'finance_analysis.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 st.caption('This app is designed to process uploaded statements in-session without intentionally persisting the original files.')
