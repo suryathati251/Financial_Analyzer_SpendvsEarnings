@@ -7,7 +7,7 @@ import pandas as pd
 import pdfplumber
 
 CATEGORY_RULES = {
-    "Income": [r"payroll", r"direct deposit", r"payment from", r"zelle payment from", r"interest", r"dividend", r"refund", r"credit"],
+    "Income": [r"payroll", r"direct deposit", r"payment from", r"zelle payment from", r"interest", r"dividend"],
     "Housing": [r"rent", r"mortgage", r"hoa", r"clickpay", r"firstservice"],
     "Utilities": [r"utility", r"firstenergy", r"public services electric", r"pse&g", r"att bill payment", r"cricket wireless", r"phone", r"internet", r"ezpass"],
     "Groceries": [r"costco", r"stop shop", r"shoprite", r"trader joe", r"patel brothers", r"acme", r"whole foods", r"wegmans", r"apna bazar"],
@@ -18,11 +18,15 @@ CATEGORY_RULES = {
     "Insurance": [r"geico", r"insurance", r"firstservice"],
     "Subscriptions": [r"patreon", r"uber one", r"youtube", r"disney plus", r"hp instant ink", r"linkedin", r"tesla subscription", r"apple\.combill"],
     "Travel": [r"airbnb", r"united", r"american air", r"alaska air", r"chase travel", r"cruise", r"dcl", r"frontier"],
-    "Transfers": [r"payment thank you", r"online payment", r"payment to chase card", r"online realtime transfer", r"online transfer to sav", r"zelle payment to", r"robinhood debits", r"transfer to bofa"],
+    "Transfers": [r"payment thank you", r"mobile payment", r"online payment", r"payment to chase card", r"online realtime transfer", r"online transfer", r"zelle payment to", r"robinhood debits", r"\btransfer\b"],
     "Fees": [r"fee", r"interest charge", r"annual membership fee", r"late fee"],
     "Education": [r"outschool", r"quizlet", r"board of educa", r"taekwondo", r"swim school"],
     "Entertainment": [r"sixflags", r"amc", r"urban air"],
+    "Credits/Refunds": [r"refund", r"credit", r"reimbursement", r"statement credit"],
 }
+
+EXCLUDED_CATEGORIES = {"Transfers"}
+DISCRETIONARY_CATEGORIES = {"Dining", "Shopping", "Entertainment", "Subscriptions", "Travel"}
 
 MONTH_NAMES = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 FULL_MONTH_NAMES = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
@@ -83,10 +87,14 @@ def normalize_ocr(text):
 
 def classify_category(desc, amount):
     text = str(desc).lower()
+    if re.search(r"payment thank you|mobile payment|online payment|payment to chase card|online realtime transfer|online transfer|zelle payment to|\btransfer\b", text):
+        return "Transfers"
+    if amount > 0 and re.search(r"refund|credit|reimbursement|adjustment", text):
+        return "Credits/Refunds"
     for cat, pats in CATEGORY_RULES.items():
         if any(re.search(p, text) for p in pats):
             return cat
-    return "Income" if amount > 0 else "Other"
+    return "Other"
 
 
 def read_pdf_pages(file_bytes):
@@ -345,14 +353,26 @@ def extract_citi_monthly(file_bytes, source_name):
     full_text = "\n".join(pages)
     fallback_year = statement_year(full_text)
     for text in pages:
+        mode = None
         for raw in text.splitlines():
             line = compact(raw)
-            m = re.match(rf"^(\d{{4}})\s+(\d{{4}})\s+(.+?)\s+({AMOUNT})$", line)
+            if "Payments, Credits and Adjustments" in line:
+                mode = "credit"
+                continue
+            if line == "PURCHASES":
+                mode = "purchase"
+                continue
+            m = re.match(rf"^(\d{{4}}|\d{{2}}/\d{{2}})(?:\s+(\d{{4}}|\d{{2}}/\d{{2}}))?\s+(.+?)\s+({AMOUNT})$", line)
             if not m:
                 continue
             sale, _post, desc, amt = m.groups()
             year = infer_year(sale, full_text, fallback_year)
-            rows.append({"date": f"{sale[:2]}/{sale[2:]}/{year}", "description": compact(desc), "net_amount": parse_amount(amt), "statement_category": None})
+            date_txt = f"{sale[:2]}/{sale[2:]}/{year}" if "/" not in sale else f"{sale}/{year}"
+            amount = parse_amount(amt)
+            desc_l = desc.lower()
+            is_credit = amount < 0 or "payment" in desc_l or "credit" in desc_l or "refund" in desc_l
+            net = abs(amount) if is_credit else -abs(amount)
+            rows.append({"date": date_txt, "description": compact(desc), "net_amount": net, "statement_category": mode})
     if not rows:
         raise ValueError("No Citi monthly transactions extracted.")
     return finalize_df(rows, source_name)
@@ -508,10 +528,13 @@ def normalize_categories(df):
         "FEES_AND_ADJUSTMENTS": "Fees",
         "PROFESSIONAL_SERVICES": "Other",
     }
-    df["category"] = [
+    categories = [
         mapping.get(sc, classify_category(d, a))
         for sc, d, a in zip(df.get("statement_category", [None] * len(df)), df["description"], df["net_amount"])
     ]
+    df["category"] = categories
+    df.loc[(df["net_amount"] > 0) & (df.get("statement_category", pd.Series(index=df.index, dtype=object)) == "credit") & (df["category"] != "Transfers"), "category"] = "Credits/Refunds"
+    df.loc[(df["net_amount"] > 0) & ~df["category"].isin(["Income", "Transfers"]), "category"] = "Credits/Refunds"
     return df
 
 
@@ -527,22 +550,74 @@ def analyze(df):
     if "statement_category" not in df:
         df["statement_category"] = None
     df = normalize_categories(df)
+    df["is_transfer"] = df["category"].isin(EXCLUDED_CATEGORIES)
+    df["is_income"] = (df["net_amount"] > 0) & (df["category"] == "Income")
+    df["is_expense"] = (df["net_amount"] < 0) & ~df["is_transfer"] & ~df["category"].eq("Credits/Refunds")
+    df["is_credit"] = (df["net_amount"] > 0) & df["category"].eq("Credits/Refunds")
     df["month"] = df["date"].dt.to_period("M").astype(str)
-    df["income"] = np.where(df["net_amount"] > 0, df["net_amount"], 0.0)
-    df["expense"] = np.where(df["net_amount"] < 0, -df["net_amount"], 0.0)
-    monthly = df.groupby("month", as_index=False).agg(income=("income", "sum"), expenses=("expense", "sum"), transactions=("net_amount", "count"))
-    monthly["net"] = monthly["income"] - monthly["expenses"]
+    df["income"] = np.where(df["is_income"], df["net_amount"], 0.0)
+    df["expense"] = np.where(df["is_expense"], -df["net_amount"], 0.0)
+    df["credits_refunds"] = np.where(df["is_credit"], df["net_amount"], 0.0)
+    monthly = df.groupby("month", as_index=False).agg(
+        income=("income", "sum"),
+        expenses=("expense", "sum"),
+        credits_refunds=("credits_refunds", "sum"),
+        transfers=("is_transfer", "sum"),
+        transactions=("net_amount", "count"),
+    )
+    monthly["net"] = monthly["income"] + monthly["credits_refunds"] - monthly["expenses"]
     monthly["savings_rate"] = np.where(monthly["income"] > 0, (monthly["net"] / monthly["income"]) * 100, np.nan)
     cat = df[df["expense"] > 0].groupby("category", as_index=False)["expense"].sum().sort_values("expense", ascending=False)
     return df.sort_values("date"), monthly.sort_values("month"), cat
 
 
-def to_excel(monthly, cat, txns):
+def suggest_expense_cuts(txns, cat):
+    if cat.empty:
+        return pd.DataFrame(columns=["category", "total_spend", "monthly_avg", "suggested_cut", "why"])
+    month_count = max(txns["month"].nunique(), 1)
+    rows = []
+    for _, row in cat.iterrows():
+        category = row["category"]
+        if category not in DISCRETIONARY_CATEGORIES:
+            continue
+        total = float(row["expense"])
+        monthly_avg = total / month_count
+        if monthly_avg < 25:
+            continue
+        pct = 0.25 if category in {"Dining", "Shopping", "Entertainment"} else 0.15
+        suggested_cut = monthly_avg * pct
+        top = (
+            txns[(txns["category"] == category) & (txns["expense"] > 0)]
+            .assign(merchant=lambda x: x["description"].str.replace(r"\s+\d{3,}.*$", "", regex=True).str.slice(0, 42))
+            .groupby("merchant", as_index=False)["expense"]
+            .sum()
+            .sort_values("expense", ascending=False)
+            .head(3)
+        )
+        merchants = ", ".join(top["merchant"].tolist())
+        rows.append(
+            {
+                "category": category,
+                "total_spend": round(total, 2),
+                "monthly_avg": round(monthly_avg, 2),
+                "suggested_cut": round(suggested_cut, 2),
+                "why": f"Discretionary spend; biggest merchants: {merchants}" if merchants else "Discretionary spend with room to trim.",
+            }
+        )
+    suggestions = pd.DataFrame(rows)
+    if suggestions.empty:
+        return suggestions
+    return suggestions.sort_values("suggested_cut", ascending=False)
+
+
+def to_excel(monthly, cat, txns, suggestions=None):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         monthly.to_excel(writer, index=False, sheet_name="Monthly Summary")
         cat.to_excel(writer, index=False, sheet_name="Categories")
         txns.to_excel(writer, index=False, sheet_name="Transactions")
+        if suggestions is not None:
+            suggestions.to_excel(writer, index=False, sheet_name="Cut Suggestions")
     return buf.getvalue()
 
 
@@ -566,21 +641,41 @@ def main():
         st.stop()
 
     df, monthly, cat = analyze(df)
-    col1, col2 = st.columns(2)
+    suggestions = suggest_expense_cuts(df, cat)
+    total_income = monthly["income"].sum()
+    total_expenses = monthly["expenses"].sum()
+    total_net = monthly["net"].sum()
+
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Transactions", len(df))
     col2.metric("Files parsed", df["source_file"].nunique())
+    col3.metric("Income", f"${total_income:,.0f}")
+    col4.metric("Net", f"${total_net:,.0f}", delta=f"Expenses ${total_expenses:,.0f}")
 
     fig = go.Figure()
     fig.add_bar(x=monthly["month"], y=monthly["income"], name="Income")
     fig.add_bar(x=monthly["month"], y=monthly["expenses"], name="Expenses")
+    fig.add_bar(x=monthly["month"], y=monthly["credits_refunds"], name="Credits/Refunds")
     fig.add_scatter(x=monthly["month"], y=monthly["net"], name="Net", mode="lines+markers")
     fig.update_layout(barmode="group", height=420)
     st.plotly_chart(fig, use_container_width=True)
 
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Expenses by Category")
+        st.dataframe(cat, use_container_width=True)
+    with right:
+        st.subheader("Suggested Cuts")
+        if suggestions.empty:
+            st.info("No obvious discretionary categories to cut based on the parsed data.")
+        else:
+            st.dataframe(suggestions, use_container_width=True)
+
+    st.subheader("Transactions")
     st.dataframe(df.head(50), use_container_width=True)
     st.download_button(
         "Download workbook",
-        to_excel(monthly, cat, df),
+        to_excel(monthly, cat, df, suggestions),
         "finance_analysis.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
